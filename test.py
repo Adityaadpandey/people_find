@@ -5,6 +5,7 @@ import requests
 from datetime import datetime
 import face_recognition
 from dotenv import load_dotenv
+from multiprocessing import Pool, cpu_count
 
 # Load environment variables from .env file
 load_dotenv()
@@ -13,37 +14,35 @@ load_dotenv()
 L = instaloader.Instaloader()
 
 # Function to download profile picture
-def download_profile_pic(path, url):
+def download_profile_pic(username):
     try:
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        # Download the picture
-        response = requests.get(url, stream=True)
+        profile = instaloader.Profile.from_username(L.context, username)
+        profile_pic_url = profile.profile_pic_url
+        profile_pic_path = f"instagram_followings/{username}.jpg"
+        response = requests.get(profile_pic_url, stream=True)
         if response.status_code == 200:
-            with open(path, 'wb') as out_file:
-                for chunk in response.iter_content(1024):
-                    out_file.write(chunk)
-            os.utime(path, (datetime.now().timestamp(), datetime.now().timestamp()))
-            print(f"Downloaded: {path}")
+            with open(profile_pic_path, 'wb') as out_file:
+                out_file.write(response.content)
+            os.utime(profile_pic_path, (datetime.now().timestamp(), datetime.now().timestamp()))
+            return username, profile_pic_path
         else:
-            print(f"Failed to download {url}: {response.status_code}")
+            print(f"Failed to download {profile_pic_url}: {response.status_code}")
+            return None, None
     except Exception as e:
-        print(f"Failed to download {url}: {e}")
+        print(f"Failed to download profile picture for {username}: {e}")
+        return None, None
 
 # Function to check if an image contains a face and generate embeddings
-def get_face_embedding(image_path):
+def get_face_embedding(profile_pic_path):
     try:
-        # Load the image file into a numpy array
-        image = face_recognition.load_image_file(image_path)
-        # Find all the faces and face encodings in the image
+        image = face_recognition.load_image_file(profile_pic_path)
         face_encodings = face_recognition.face_encodings(image)
         if face_encodings:
-            return face_encodings[0]  # Return the first face encoding found
+            return face_encodings[0].tolist()
         else:
             return None
     except Exception as e:
-        print(f"Failed to process {image_path}: {e}")
+        print(f"Failed to process {profile_pic_path}: {e}")
         return None
 
 # Get Instagram username and password from environment variables
@@ -58,7 +57,6 @@ if not instagram_username or not instagram_password:
 try:
     L.load_session_from_file(instagram_username)
 except FileNotFoundError:
-    # If session file doesn't exist, log in and save session
     L.login(instagram_username, instagram_password)
     L.save_session_to_file()
 
@@ -70,49 +68,43 @@ directory = 'instagram_followings'
 if not os.path.exists(directory):
     os.makedirs(directory)
 
+# Function to process each user
+def process_user(username):
+    profile_pic_username, profile_pic_path = download_profile_pic(username)
+    if profile_pic_username and profile_pic_path:
+        face_embedding = get_face_embedding(profile_pic_path)
+        return {
+            'username': profile_pic_username,
+            'profile_pic_path': profile_pic_path,
+            'face_embedding': face_embedding
+        }
+    else:
+        return None
+
 # Fetch and save data of followings
 followings_data = []
-for following in profile.get_followees():
-    username = following.username
-    full_name = following.full_name
-    profile_pic_url = following.profile_pic_url
+followings = [following.username for following in profile.get_followees()]
 
-    # Download profile picture
-    profile_pic_path = f"{directory}/{username}.jpg"
-    download_profile_pic(profile_pic_path, profile_pic_url)
+# Parallel processing for followings
+with Pool(cpu_count()) as pool:
+    followings_data = pool.map(process_user, followings)
 
-    # Check if the profile picture contains a face and get the embedding
-    face_embedding = get_face_embedding(profile_pic_path)
-    
-    # Append to followings data list
-    followings_data.append({
-        'username': username,
-        'full_name': full_name,
-        'profile_pic_path': profile_pic_path,
-        'face_embedding': face_embedding.tolist() if face_embedding is not None else None
-    })
+# Filter out None results
+followings_data = [data for data in followings_data if data is not None]
 
-    # Fetch and save data of followings' followings
-    following_profile = instaloader.Profile.from_username(L.context, username)
-    for ff in following_profile.get_followees():
-        ff_username = ff.username
-        ff_full_name = ff.full_name
-        ff_profile_pic_url = ff.profile_pic_url
+# Fetch and save data of followings' followings
+for following in followings:
+    try:
+        following_profile = instaloader.Profile.from_username(L.context, following)
+        followings_followings = [ff.username for ff in following_profile.get_followees()]
 
-        # Download profile picture
-        ff_profile_pic_path = f"{directory}/{ff_username}.jpg"
-        download_profile_pic(ff_profile_pic_path, ff_profile_pic_url)
+        with Pool(cpu_count()) as pool:
+            followings_followings_data = pool.map(process_user, followings_followings)
 
-        # Check if the profile picture contains a face and get the embedding
-        ff_face_embedding = get_face_embedding(ff_profile_pic_path)
-
-        # Append to followings data list
-        followings_data.append({
-            'username': ff_username,
-            'full_name': ff_full_name,
-            'profile_pic_path': ff_profile_pic_path,
-            'face_embedding': ff_face_embedding.tolist() if ff_face_embedding is not None else None
-        })
+        followings_followings_data = [data for data in followings_followings_data if data is not None]
+        followings_data.extend(followings_followings_data)
+    except Exception as e:
+        print(f"Failed to fetch followings for {following}: {e}")
 
 # Save followings data to a JSON file
 with open(f'{directory}/followings_data.json', 'w') as f:
